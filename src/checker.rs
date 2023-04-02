@@ -1,12 +1,13 @@
 use crate::finder::Checker;
+use futures::{stream::futures_unordered::FuturesUnordered, StreamExt};
 #[cfg(any(unix, target_os = "wasi"))]
 use std::ffi::CString;
-use std::fs;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "wasi")]
 use std::os::wasi::ffi::OsStrExt;
-use std::path::Path;
+use std::{iter::FromIterator, path::Path};
+use tokio::fs;
 
 pub struct ExecutableChecker;
 
@@ -16,16 +17,17 @@ impl ExecutableChecker {
     }
 }
 
+#[async_trait::async_trait]
 impl Checker for ExecutableChecker {
     #[cfg(any(unix, target_os = "wasi"))]
-    fn is_valid(&self, path: &Path) -> bool {
+    async fn is_valid(&self, path: &Path) -> bool {
         CString::new(path.as_os_str().as_bytes())
             .map(|c| unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 })
             .unwrap_or(false)
     }
 
     #[cfg(windows)]
-    fn is_valid(&self, _path: &Path) -> bool {
+    async fn is_valid(&self, _path: &Path) -> bool {
         true
     }
 }
@@ -38,10 +40,12 @@ impl ExistedChecker {
     }
 }
 
+#[async_trait::async_trait]
 impl Checker for ExistedChecker {
     #[cfg(target_os = "windows")]
-    fn is_valid(&self, path: &Path) -> bool {
+    async fn is_valid(&self, path: &Path) -> bool {
         fs::symlink_metadata(path)
+            .await
             .map(|metadata| {
                 let file_type = metadata.file_type();
                 file_type.is_file() || file_type.is_symlink()
@@ -50,8 +54,9 @@ impl Checker for ExistedChecker {
     }
 
     #[cfg(not(target_os = "windows"))]
-    fn is_valid(&self, path: &Path) -> bool {
+    async fn is_valid(&self, path: &Path) -> bool {
         fs::metadata(path)
+            .await
             .map(|metadata| metadata.is_file())
             .unwrap_or(false)
     }
@@ -74,8 +79,12 @@ impl CompositeChecker {
     }
 }
 
+#[async_trait::async_trait]
 impl Checker for CompositeChecker {
-    fn is_valid(&self, path: &Path) -> bool {
-        self.checkers.iter().all(|checker| checker.is_valid(path))
+    async fn is_valid(&self, path: &Path) -> bool {
+        let jobs = self.checkers.iter().map(|checker| checker.is_valid(path));
+        FuturesUnordered::from_iter(jobs)
+            .all(|x| async move { x })
+            .await
     }
 }

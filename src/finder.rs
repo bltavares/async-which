@@ -3,19 +3,21 @@ use crate::error::*;
 #[cfg(windows)]
 use crate::helper::has_executable_extension;
 use either::Either;
+use futures::prelude::*;
 #[cfg(feature = "regex")]
 use regex::Regex;
 #[cfg(feature = "regex")]
 use std::borrow::Borrow;
 use std::env;
 use std::ffi::OsStr;
-#[cfg(any(feature = "regex", target_os = "windows"))]
-use std::fs;
 use std::iter;
 use std::path::{Path, PathBuf};
+#[cfg(any(feature = "regex", target_os = "windows"))]
+use tokio::fs;
 
-pub trait Checker {
-    fn is_valid(&self, path: &Path) -> bool;
+#[async_trait::async_trait]
+pub trait Checker: Sync {
+    async fn is_valid(&self, path: &Path) -> bool;
 }
 
 trait PathExt {
@@ -58,7 +60,7 @@ impl Finder {
         paths: Option<U>,
         cwd: Option<V>,
         binary_checker: CompositeChecker,
-    ) -> Result<impl Iterator<Item = PathBuf>>
+    ) -> Result<impl Stream<Item = PathBuf>>
     where
         T: AsRef<OsStr>,
         U: AsRef<OsStr>,
@@ -80,9 +82,14 @@ impl Finder {
             }
         };
 
-        Ok(binary_path_candidates
-            .filter(move |p| binary_checker.is_valid(p))
-            .map(correct_casing))
+        let tasks = async_stream::stream! {
+            for p in binary_path_candidates {
+                if binary_checker.is_valid(&p).await {
+                    yield correct_casing(p).await;
+                }
+            }
+        };
+        Ok(tasks)
     }
 
     #[cfg(feature = "regex")]
@@ -211,14 +218,16 @@ impl Finder {
 }
 
 #[cfg(target_os = "windows")]
-fn correct_casing(mut p: PathBuf) -> PathBuf {
+async fn correct_casing(mut p: PathBuf) -> PathBuf {
     if let (Some(parent), Some(file_name)) = (p.parent(), p.file_name()) {
-        if let Ok(iter) = fs::read_dir(parent) {
-            for e in iter.filter_map(std::result::Result::ok) {
-                if e.file_name().eq_ignore_ascii_case(file_name) {
-                    p.pop();
-                    p.push(e.file_name());
-                    break;
+        if let Ok(mut iter) = fs::read_dir(parent).await {
+            while let Ok(e) = iter.next_entry().await {
+                if let Some(e) = e {
+                    if e.file_name().eq_ignore_ascii_case(file_name) {
+                        p.pop();
+                        p.push(e.file_name());
+                        break;
+                    }
                 }
             }
         }
@@ -227,6 +236,6 @@ fn correct_casing(mut p: PathBuf) -> PathBuf {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn correct_casing(p: PathBuf) -> PathBuf {
+async fn correct_casing(p: PathBuf) -> PathBuf {
     p
 }

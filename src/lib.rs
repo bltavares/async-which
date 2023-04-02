@@ -6,12 +6,15 @@
 //! To find which rustc executable binary is using:
 //!
 //! ```no_run
-//! use which::which;
+//! # tokio_test::block_on(async {
+//!
+//! use async_which::which;
 //! use std::path::PathBuf;
 //!
-//! let result = which("rustc").unwrap();
+//! let result = which("rustc").await.unwrap();
 //! assert_eq!(result, PathBuf::from("/usr/bin/rustc"));
 //!
+//! # })
 //! ```
 
 mod checker;
@@ -27,6 +30,10 @@ use std::fmt;
 use std::path;
 
 use std::ffi::{OsStr, OsString};
+use std::pin::pin;
+
+use futures::Stream;
+use futures::StreamExt;
 
 use crate::checker::{CompositeChecker, ExecutableChecker, ExistedChecker};
 pub use crate::error::*;
@@ -46,15 +53,19 @@ use crate::finder::Finder;
 /// # Example
 ///
 /// ```no_run
-/// use which::which;
+/// # tokio_test::block_on(async {
+///
+/// use async_which::which;
 /// use std::path::PathBuf;
 ///
-/// let result = which::which("rustc").unwrap();
+/// let result = async_which::which("rustc").await.unwrap();
 /// assert_eq!(result, PathBuf::from("/usr/bin/rustc"));
 ///
+/// # })
 /// ```
-pub fn which<T: AsRef<OsStr>>(binary_name: T) -> Result<path::PathBuf> {
-    which_all(binary_name).and_then(|mut i| i.next().ok_or(Error::CannotFindBinaryPath))
+pub async fn which<T: AsRef<OsStr>>(binary_name: T) -> Result<path::PathBuf> {
+    let candidates = which_all(binary_name)?;
+    pin!(candidates).next().await.ok_or(Error::CannotFindBinaryPath)
 }
 
 /// Find an executable binary's path by name, ignoring `cwd`.
@@ -70,19 +81,21 @@ pub fn which<T: AsRef<OsStr>>(binary_name: T) -> Result<path::PathBuf> {
 /// # Example
 ///
 /// ```no_run
-/// use which::which;
+/// # tokio_test::block_on(async {
+/// use async_which::which;
 /// use std::path::PathBuf;
 ///
-/// let result = which::which_global("rustc").unwrap();
+/// let result = async_which::which_global("rustc").await.unwrap();
 /// assert_eq!(result, PathBuf::from("/usr/bin/rustc"));
-///
+/// # })
 /// ```
-pub fn which_global<T: AsRef<OsStr>>(binary_name: T) -> Result<path::PathBuf> {
-    which_all_global(binary_name).and_then(|mut i| i.next().ok_or(Error::CannotFindBinaryPath))
+pub async fn which_global<T: AsRef<OsStr>>(binary_name: T) -> Result<path::PathBuf> {
+    let  candidates = which_all_global(binary_name)?;
+    pin!(candidates).next().await.ok_or(Error::CannotFindBinaryPath)
 }
 
 /// Find all binaries with `binary_name` using `cwd` to resolve relative paths.
-pub fn which_all<T: AsRef<OsStr>>(binary_name: T) -> Result<impl Iterator<Item = path::PathBuf>> {
+pub fn which_all<T: AsRef<OsStr>>(binary_name: T) -> Result<impl Stream<Item = path::PathBuf>> {
     let cwd = env::current_dir().ok();
 
     let binary_checker = build_binary_checker();
@@ -95,7 +108,7 @@ pub fn which_all<T: AsRef<OsStr>>(binary_name: T) -> Result<impl Iterator<Item =
 /// Find all binaries with `binary_name` ignoring `cwd`.
 pub fn which_all_global<T: AsRef<OsStr>>(
     binary_name: T,
-) -> Result<impl Iterator<Item = path::PathBuf>> {
+) -> Result<impl Stream<Item = path::PathBuf>> {
     let binary_checker = build_binary_checker();
 
     let finder = Finder::new();
@@ -122,11 +135,11 @@ pub fn which_all_global<T: AsRef<OsStr>>(
 ///
 /// ```no_run
 /// use regex::Regex;
-/// use which::which;
+/// use async_which::which;
 /// use std::path::PathBuf;
 ///
 /// let re = Regex::new(r"python\d$").unwrap();
-/// let binaries: Vec<PathBuf> = which::which_re(re).unwrap().collect();
+/// let binaries: Vec<PathBuf> = async_which::which_re(re).unwrap().collect();
 /// let python_paths = vec![PathBuf::from("/usr/bin/python2"), PathBuf::from("/usr/bin/python3")];
 /// assert_eq!(binaries, python_paths);
 /// ```
@@ -134,7 +147,7 @@ pub fn which_all_global<T: AsRef<OsStr>>(
 /// Find all cargo subcommand executables on the path:
 ///
 /// ```
-/// use which::which_re;
+/// use async_which::which_re;
 /// use regex::Regex;
 ///
 /// which_re(Regex::new("^cargo-.*").unwrap()).unwrap()
@@ -146,14 +159,14 @@ pub fn which_re(regex: impl Borrow<Regex>) -> Result<impl Iterator<Item = path::
 }
 
 /// Find `binary_name` in the path list `paths`, using `cwd` to resolve relative paths.
-pub fn which_in<T, U, V>(binary_name: T, paths: Option<U>, cwd: V) -> Result<path::PathBuf>
+pub async fn which_in<T, U, V>(binary_name: T, paths: Option<U>, cwd: V) -> Result<path::PathBuf>
 where
     T: AsRef<OsStr>,
     U: AsRef<OsStr>,
     V: AsRef<path::Path>,
 {
-    which_in_all(binary_name, paths, cwd)
-        .and_then(|mut i| i.next().ok_or(Error::CannotFindBinaryPath))
+    let mut candidates = which_in_all(binary_name, paths, cwd)?;
+    pin!(candidates).next().await.ok_or(Error::CannotFindBinaryPath)
 }
 
 /// Find all binaries matching a regular expression in a list of paths.
@@ -170,12 +183,12 @@ where
 ///
 /// ```no_run
 /// use regex::Regex;
-/// use which::which;
+/// use async_which::which;
 /// use std::path::PathBuf;
 ///
 /// let re = Regex::new(r"python\d$").unwrap();
 /// let paths = Some("/usr/bin:/usr/local/bin");
-/// let binaries: Vec<PathBuf> = which::which_re_in(re, paths).unwrap().collect();
+/// let binaries: Vec<PathBuf> = async_which::which_re_in(re, paths).unwrap().collect();
 /// let python_paths = vec![PathBuf::from("/usr/bin/python2"), PathBuf::from("/usr/bin/python3")];
 /// assert_eq!(binaries, python_paths);
 /// ```
@@ -199,7 +212,7 @@ pub fn which_in_all<T, U, V>(
     binary_name: T,
     paths: Option<U>,
     cwd: V,
-) -> Result<impl Iterator<Item = path::PathBuf>>
+) -> Result<impl Stream<Item = path::PathBuf>>
 where
     T: AsRef<OsStr>,
     U: AsRef<OsStr>,
@@ -216,7 +229,7 @@ where
 pub fn which_in_global<T, U>(
     binary_name: T,
     paths: Option<U>,
-) -> Result<impl Iterator<Item = path::PathBuf>>
+) -> Result<impl Stream<Item = path::PathBuf>>
 where
     T: AsRef<OsStr>,
     U: AsRef<OsStr>,
@@ -351,13 +364,13 @@ impl WhichConfig {
     }
 
     /// Finishes configuring, runs the query and returns the first result.
-    pub fn first_result(self) -> Result<path::PathBuf> {
-        self.all_results()
-            .and_then(|mut i| i.next().ok_or(Error::CannotFindBinaryPath))
+    pub async fn first_result(self) -> Result<path::PathBuf> {
+        let mut candidates = self.all_results()?;
+        pin!(candidates).next().await.ok_or(Error::CannotFindBinaryPath)
     }
 
     /// Finishes configuring, runs the query and returns all results.
-    pub fn all_results(self) -> Result<impl Iterator<Item = path::PathBuf>> {
+    pub fn all_results(self) -> Result<impl Stream<Item = path::PathBuf>> {
         let binary_checker = build_binary_checker();
 
         let finder = Finder::new();
@@ -377,29 +390,26 @@ impl WhichConfig {
             None | Some(either::Either::Left(true)) => env::current_dir().ok(),
         };
 
-        finder
-            .find(
-                self.binary_name.expect(
-                    "binary_name not set! You must set binary_name or regex before searching!",
-                ),
-                paths,
-                cwd,
-                binary_checker,
-            )
-            .map(|i| Box::new(i) as Box<dyn Iterator<Item = path::PathBuf>>)
+        finder.find(
+            self.binary_name
+                .expect("binary_name not set! You must set binary_name or regex before searching!"),
+            paths,
+            cwd,
+            binary_checker,
+        )
     }
 }
 
 /// An owned, immutable wrapper around a `PathBuf` containing the path of an executable.
 ///
-/// The constructed `PathBuf` is the output of `which` or `which_in`, but `which::Path` has the
+/// The constructed `PathBuf` is the output of `which` or `which_in`, but `async_which::Path` has the
 /// advantage of being a type distinct from `std::path::Path` and `std::path::PathBuf`.
 ///
-/// It can be beneficial to use `which::Path` instead of `std::path::Path` when you want the type
+/// It can be beneficial to use `async_which::Path` instead of `std::path::Path` when you want the type
 /// system to enforce the need for a path that exists and points to a binary that is executable.
 ///
-/// Since `which::Path` implements `Deref` for `std::path::Path`, all methods on `&std::path::Path`
-/// are also available to `&which::Path` values.
+/// Since `async_which::Path` implements `Deref` for `std::path::Path`, all methods on `&std::path::Path`
+/// are also available to `&async_which::Path` values.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Path {
     inner: path::PathBuf,
@@ -409,14 +419,14 @@ impl Path {
     /// Returns the path of an executable binary by name.
     ///
     /// This calls `which` and maps the result into a `Path`.
-    pub fn new<T: AsRef<OsStr>>(binary_name: T) -> Result<Path> {
-        which(binary_name).map(|inner| Path { inner })
+    pub async fn new<T: AsRef<OsStr>>(binary_name: T) -> Result<Path> {
+        which(binary_name).await.map(|inner| Path { inner })
     }
 
     /// Returns the paths of all executable binaries by a name.
     ///
     /// this calls `which_all` and maps the results into `Path`s.
-    pub fn all<T: AsRef<OsStr>>(binary_name: T) -> Result<impl Iterator<Item = Path>> {
+    pub fn all<T: AsRef<OsStr>>(binary_name: T) -> Result<impl Stream<Item = Path>> {
         which_all(binary_name).map(|inner| inner.map(|inner| Path { inner }))
     }
 
@@ -424,13 +434,15 @@ impl Path {
     /// current working directory `cwd` to resolve relative paths.
     ///
     /// This calls `which_in` and maps the result into a `Path`.
-    pub fn new_in<T, U, V>(binary_name: T, paths: Option<U>, cwd: V) -> Result<Path>
+    pub async fn new_in<T, U, V>(binary_name: T, paths: Option<U>, cwd: V) -> Result<Path>
     where
         T: AsRef<OsStr>,
         U: AsRef<OsStr>,
         V: AsRef<path::Path>,
     {
-        which_in(binary_name, paths, cwd).map(|inner| Path { inner })
+        which_in(binary_name, paths, cwd)
+            .await
+            .map(|inner| Path { inner })
     }
 
     /// Returns all paths of an executable binary by name in the path list `paths` and using the
@@ -441,7 +453,7 @@ impl Path {
         binary_name: T,
         paths: Option<U>,
         cwd: V,
-    ) -> Result<impl Iterator<Item = Path>>
+    ) -> Result<impl Stream<Item = Path>>
     where
         T: AsRef<OsStr>,
         U: AsRef<OsStr>,
@@ -455,7 +467,7 @@ impl Path {
         self.inner.as_path()
     }
 
-    /// Consumes the `which::Path`, yielding its underlying `std::path::PathBuf`.
+    /// Consumes the `async_which::Path`, yielding its underlying `std::path::PathBuf`.
     pub fn into_path_buf(self) -> path::PathBuf {
         self.inner
     }
@@ -521,8 +533,9 @@ impl CanonicalPath {
     /// Returns the canonical path of an executable binary by name.
     ///
     /// This calls `which` and `Path::canonicalize` and maps the result into a `CanonicalPath`.
-    pub fn new<T: AsRef<OsStr>>(binary_name: T) -> Result<CanonicalPath> {
+    pub async fn new<T: AsRef<OsStr>>(binary_name: T) -> Result<CanonicalPath> {
         which(binary_name)
+            .await
             .and_then(|p| p.canonicalize().map_err(|_| Error::CannotCanonicalize))
             .map(|inner| CanonicalPath { inner })
     }
@@ -532,7 +545,7 @@ impl CanonicalPath {
     /// This calls `which_all` and `Path::canonicalize` and maps the results into `CanonicalPath`s.
     pub fn all<T: AsRef<OsStr>>(
         binary_name: T,
-    ) -> Result<impl Iterator<Item = Result<CanonicalPath>>> {
+    ) -> Result<impl Stream<Item = Result<CanonicalPath>>> {
         which_all(binary_name).map(|inner| {
             inner.map(|inner| {
                 inner
@@ -547,13 +560,14 @@ impl CanonicalPath {
     /// using the current working directory `cwd` to resolve relative paths.
     ///
     /// This calls `which_in` and `Path::canonicalize` and maps the result into a `CanonicalPath`.
-    pub fn new_in<T, U, V>(binary_name: T, paths: Option<U>, cwd: V) -> Result<CanonicalPath>
+    pub async fn new_in<T, U, V>(binary_name: T, paths: Option<U>, cwd: V) -> Result<CanonicalPath>
     where
         T: AsRef<OsStr>,
         U: AsRef<OsStr>,
         V: AsRef<path::Path>,
     {
         which_in(binary_name, paths, cwd)
+            .await
             .and_then(|p| p.canonicalize().map_err(|_| Error::CannotCanonicalize))
             .map(|inner| CanonicalPath { inner })
     }
@@ -566,7 +580,7 @@ impl CanonicalPath {
         binary_name: T,
         paths: Option<U>,
         cwd: V,
-    ) -> Result<impl Iterator<Item = Result<CanonicalPath>>>
+    ) -> Result<impl Stream<Item = Result<CanonicalPath>>>
     where
         T: AsRef<OsStr>,
         U: AsRef<OsStr>,
@@ -587,7 +601,7 @@ impl CanonicalPath {
         self.inner.as_path()
     }
 
-    /// Consumes the `which::CanonicalPath`, yielding its underlying `std::path::PathBuf`.
+    /// Consumes the `async_which::CanonicalPath`, yielding its underlying `std::path::PathBuf`.
     pub fn into_path_buf(self) -> path::PathBuf {
         self.inner
     }
