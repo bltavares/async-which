@@ -6,8 +6,7 @@ use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "wasi")]
 use std::os::wasi::ffi::OsStrExt;
-use std::{iter::FromIterator, path::Path};
-use tokio::fs;
+use std::{future, iter::FromIterator, path::Path};
 
 pub struct ExecutableChecker;
 
@@ -44,7 +43,7 @@ impl ExistedChecker {
 impl Checker for ExistedChecker {
     #[cfg(target_os = "windows")]
     async fn is_valid(&self, path: &Path) -> bool {
-        fs::symlink_metadata(path)
+        tokio::fs::symlink_metadata(path)
             .await
             .map(|metadata| {
                 let file_type = metadata.file_type();
@@ -53,12 +52,24 @@ impl Checker for ExistedChecker {
             .unwrap_or(false)
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(unix)]
     async fn is_valid(&self, path: &Path) -> bool {
-        fs::metadata(path)
+        tokio::fs::metadata(path)
             .await
             .map(|metadata| metadata.is_file())
             .unwrap_or(false)
+    }
+
+    #[cfg(target_os = "wasi")]
+    async fn is_valid(&self, path: &Path) -> bool {
+        let path = path.to_owned();
+        tokio::task::spawn(async {
+            std::fs::metadata(path)
+                .map(|metadata| metadata.is_file())
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false)
     }
 }
 
@@ -83,8 +94,6 @@ impl CompositeChecker {
 impl Checker for CompositeChecker {
     async fn is_valid(&self, path: &Path) -> bool {
         let jobs = self.checkers.iter().map(|checker| checker.is_valid(path));
-        FuturesUnordered::from_iter(jobs)
-            .all(|x| async move { x })
-            .await
+        FuturesUnordered::from_iter(jobs).all(future::ready).await
     }
 }

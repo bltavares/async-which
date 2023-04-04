@@ -27,11 +27,13 @@ mod helper;
 use std::borrow::Borrow;
 use std::env;
 use std::fmt;
+use std::future;
 use std::path;
 
 use std::ffi::{OsStr, OsString};
 use std::pin::pin;
 
+use futures::stream;
 use futures::Stream;
 use futures::StreamExt;
 
@@ -64,8 +66,11 @@ use crate::finder::Finder;
 /// # })
 /// ```
 pub async fn which<T: AsRef<OsStr>>(binary_name: T) -> Result<path::PathBuf> {
-    let candidates = which_all(binary_name)?;
-    pin!(candidates).next().await.ok_or(Error::CannotFindBinaryPath)
+    let candidates = which_all(binary_name).take_while(|x| future::ready(x.is_ok()));
+    pin!(candidates)
+        .next()
+        .await
+        .unwrap_or(Err(Error::CannotFindBinaryPath))
 }
 
 /// Find an executable binary's path by name, ignoring `cwd`.
@@ -90,12 +95,15 @@ pub async fn which<T: AsRef<OsStr>>(binary_name: T) -> Result<path::PathBuf> {
 /// # })
 /// ```
 pub async fn which_global<T: AsRef<OsStr>>(binary_name: T) -> Result<path::PathBuf> {
-    let  candidates = which_all_global(binary_name)?;
-    pin!(candidates).next().await.ok_or(Error::CannotFindBinaryPath)
+    let candidates = which_all_global(binary_name).take_while(|x| future::ready(x.is_ok()));
+    pin!(candidates)
+        .next()
+        .await
+        .unwrap_or(Err(Error::CannotFindBinaryPath))
 }
 
 /// Find all binaries with `binary_name` using `cwd` to resolve relative paths.
-pub fn which_all<T: AsRef<OsStr>>(binary_name: T) -> Result<impl Stream<Item = path::PathBuf>> {
+pub fn which_all<T: AsRef<OsStr>>(binary_name: T) -> impl Stream<Item = Result<path::PathBuf>> {
     let cwd = env::current_dir().ok();
 
     let binary_checker = build_binary_checker();
@@ -108,7 +116,7 @@ pub fn which_all<T: AsRef<OsStr>>(binary_name: T) -> Result<impl Stream<Item = p
 /// Find all binaries with `binary_name` ignoring `cwd`.
 pub fn which_all_global<T: AsRef<OsStr>>(
     binary_name: T,
-) -> Result<impl Stream<Item = path::PathBuf>> {
+) -> impl Stream<Item = Result<path::PathBuf>> {
     let binary_checker = build_binary_checker();
 
     let finder = Finder::new();
@@ -134,28 +142,47 @@ pub fn which_all_global<T: AsRef<OsStr>>(
 /// Find Python executables:
 ///
 /// ```no_run
+/// # tokio_test::block_on(async {
+/// # use futures::prelude::*;
+///
 /// use regex::Regex;
 /// use async_which::which;
 /// use std::path::PathBuf;
 ///
 /// let re = Regex::new(r"python\d$").unwrap();
-/// let binaries: Vec<PathBuf> = async_which::which_re(re).unwrap().collect();
+/// let mut stream = async_which::which_re(re);
+/// let binaries  = stream.try_collect::<Vec<_>>().await.unwrap();
 /// let python_paths = vec![PathBuf::from("/usr/bin/python2"), PathBuf::from("/usr/bin/python3")];
 /// assert_eq!(binaries, python_paths);
+///
+/// # });
 /// ```
 ///
 /// Find all cargo subcommand executables on the path:
 ///
 /// ```
+/// # tokio_test::block_on(async {
+/// # use futures::prelude::*;
+///
 /// use async_which::which_re;
 /// use regex::Regex;
 ///
-/// which_re(Regex::new("^cargo-.*").unwrap()).unwrap()
-///     .for_each(|pth| println!("{}", pth.to_string_lossy()));
+/// which_re(Regex::new("^cargo-.*").unwrap())
+///     .try_for_each(|pth| async move {
+///         println!("{}", pth.to_string_lossy());
+///         Ok(())
+///     }).await;
+///
+/// # });
 /// ```
 #[cfg(feature = "regex")]
-pub fn which_re(regex: impl Borrow<Regex>) -> Result<impl Iterator<Item = path::PathBuf>> {
-    which_re_in(regex, env::var_os("PATH"))
+pub fn which_re(regex: impl Borrow<Regex>) -> impl Stream<Item = Result<path::PathBuf>> {
+    if let Some(path) = env::var_os("PATH") {
+        let regex = regex.borrow().clone();
+        which_re_in(regex, path).boxed_local()
+    } else {
+        stream::once(future::ready(Err(Error::CannotFindBinaryPath))).boxed()
+    }
 }
 
 /// Find `binary_name` in the path list `paths`, using `cwd` to resolve relative paths.
@@ -165,8 +192,12 @@ where
     U: AsRef<OsStr>,
     V: AsRef<path::Path>,
 {
-    let mut candidates = which_in_all(binary_name, paths, cwd)?;
-    pin!(candidates).next().await.ok_or(Error::CannotFindBinaryPath)
+    let mut candidates =
+        which_in_all(binary_name, paths, cwd).take_while(|x| future::ready(x.is_ok()));
+    pin!(candidates)
+        .next()
+        .await
+        .unwrap_or(Err(Error::CannotFindBinaryPath))
 }
 
 /// Find all binaries matching a regular expression in a list of paths.
@@ -182,28 +213,32 @@ where
 /// # Examples
 ///
 /// ```no_run
+/// # tokio_test::block_on(async {
+/// # use futures::prelude::*;
+///
 /// use regex::Regex;
 /// use async_which::which;
 /// use std::path::PathBuf;
 ///
 /// let re = Regex::new(r"python\d$").unwrap();
-/// let paths = Some("/usr/bin:/usr/local/bin");
-/// let binaries: Vec<PathBuf> = async_which::which_re_in(re, paths).unwrap().collect();
+/// let paths = "/usr/bin:/usr/local/bin";
+/// let binaries: Vec<PathBuf> = async_which::which_re_in(re, paths).try_collect().await.unwrap();
 /// let python_paths = vec![PathBuf::from("/usr/bin/python2"), PathBuf::from("/usr/bin/python3")];
 /// assert_eq!(binaries, python_paths);
+///
+/// # });
 /// ```
 #[cfg(feature = "regex")]
 pub fn which_re_in<T>(
     regex: impl Borrow<Regex>,
-    paths: Option<T>,
-) -> Result<impl Iterator<Item = path::PathBuf>>
+    paths: T,
+) -> impl Stream<Item = Result<path::PathBuf>>
 where
     T: AsRef<OsStr>,
 {
     let binary_checker = build_binary_checker();
 
     let finder = Finder::new();
-
     finder.find_re(regex, paths, binary_checker)
 }
 
@@ -212,7 +247,7 @@ pub fn which_in_all<T, U, V>(
     binary_name: T,
     paths: Option<U>,
     cwd: V,
-) -> Result<impl Stream<Item = path::PathBuf>>
+) -> impl Stream<Item = Result<path::PathBuf>>
 where
     T: AsRef<OsStr>,
     U: AsRef<OsStr>,
@@ -229,7 +264,7 @@ where
 pub fn which_in_global<T, U>(
     binary_name: T,
     paths: Option<U>,
-) -> Result<impl Stream<Item = path::PathBuf>>
+) -> impl Stream<Item = Result<path::PathBuf>>
 where
     T: AsRef<OsStr>,
     U: AsRef<OsStr>,
@@ -365,23 +400,29 @@ impl WhichConfig {
 
     /// Finishes configuring, runs the query and returns the first result.
     pub async fn first_result(self) -> Result<path::PathBuf> {
-        let mut candidates = self.all_results()?;
-        pin!(candidates).next().await.ok_or(Error::CannotFindBinaryPath)
+        let mut candidates = self.all_results().take_while(|x| future::ready(x.is_ok()));
+        pin!(candidates)
+            .next()
+            .await
+            .unwrap_or(Err(Error::CannotFindBinaryPath))
     }
 
     /// Finishes configuring, runs the query and returns all results.
-    pub fn all_results(self) -> Result<impl Stream<Item = path::PathBuf>> {
+    pub fn all_results(self) -> impl Stream<Item = Result<path::PathBuf>> {
         let binary_checker = build_binary_checker();
 
         let finder = Finder::new();
 
-        let paths = self.custom_path_list.or_else(|| env::var_os("PATH"));
+        let paths = match self.custom_path_list.or_else(|| env::var_os("PATH")) {
+            Some(x) => x,
+            None => {
+                return stream::once(future::ready(Err(Error::CannotFindBinaryPath))).boxed_local();
+            }
+        };
 
         #[cfg(feature = "regex")]
         if let Some(regex) = self.regex {
-            return finder
-                .find_re(regex, paths, binary_checker)
-                .map(|i| Box::new(i) as Box<dyn Iterator<Item = path::PathBuf>>);
+            return finder.find_re(regex, paths, binary_checker).boxed_local();
         }
 
         let cwd = match self.cwd {
@@ -390,13 +431,16 @@ impl WhichConfig {
             None | Some(either::Either::Left(true)) => env::current_dir().ok(),
         };
 
-        finder.find(
-            self.binary_name
-                .expect("binary_name not set! You must set binary_name or regex before searching!"),
-            paths,
-            cwd,
-            binary_checker,
-        )
+        finder
+            .find(
+                self.binary_name.expect(
+                    "binary_name not set! You must set binary_name or regex before searching!",
+                ),
+                Some(paths),
+                cwd,
+                binary_checker,
+            )
+            .boxed_local()
     }
 }
 
@@ -426,7 +470,7 @@ impl Path {
     /// Returns the paths of all executable binaries by a name.
     ///
     /// this calls `which_all` and maps the results into `Path`s.
-    pub fn all<T: AsRef<OsStr>>(binary_name: T) -> Result<impl Stream<Item = Path>> {
+    pub fn all<T: AsRef<OsStr>>(binary_name: T) -> impl Stream<Item = Result<Path>> {
         which_all(binary_name).map(|inner| inner.map(|inner| Path { inner }))
     }
 
@@ -453,7 +497,7 @@ impl Path {
         binary_name: T,
         paths: Option<U>,
         cwd: V,
-    ) -> Result<impl Stream<Item = Path>>
+    ) -> impl Stream<Item = Result<Path>>
     where
         T: AsRef<OsStr>,
         U: AsRef<OsStr>,
@@ -543,11 +587,9 @@ impl CanonicalPath {
     /// Returns the canonical paths of an executable binary by name.
     ///
     /// This calls `which_all` and `Path::canonicalize` and maps the results into `CanonicalPath`s.
-    pub fn all<T: AsRef<OsStr>>(
-        binary_name: T,
-    ) -> Result<impl Stream<Item = Result<CanonicalPath>>> {
+    pub fn all<T: AsRef<OsStr>>(binary_name: T) -> impl Stream<Item = Result<CanonicalPath>> {
         which_all(binary_name).map(|inner| {
-            inner.map(|inner| {
+            inner.and_then(|inner| {
                 inner
                     .canonicalize()
                     .map_err(|_| Error::CannotCanonicalize)
@@ -566,10 +608,16 @@ impl CanonicalPath {
         U: AsRef<OsStr>,
         V: AsRef<path::Path>,
     {
-        which_in(binary_name, paths, cwd)
-            .await
-            .and_then(|p| p.canonicalize().map_err(|_| Error::CannotCanonicalize))
-            .map(|inner| CanonicalPath { inner })
+        which_in(binary_name, paths, cwd).await.and_then(|inner| {
+            let canonical = if cfg!(target_os = "wasi") {
+                Ok(inner)
+            } else {
+                inner.canonicalize()
+            };
+            canonical
+                .map_err(|_| Error::CannotCanonicalize)
+                .map(|inner| CanonicalPath { inner })
+        })
     }
 
     /// Returns all of the canonical paths of an executable binary by name in the path list `paths` and
@@ -580,16 +628,20 @@ impl CanonicalPath {
         binary_name: T,
         paths: Option<U>,
         cwd: V,
-    ) -> Result<impl Stream<Item = Result<CanonicalPath>>>
+    ) -> impl Stream<Item = Result<CanonicalPath>>
     where
         T: AsRef<OsStr>,
         U: AsRef<OsStr>,
         V: AsRef<path::Path>,
     {
         which_in_all(binary_name, paths, cwd).map(|inner| {
-            inner.map(|inner| {
-                inner
-                    .canonicalize()
+            inner.and_then(|inner| {
+                let canonical = if cfg!(target_os = "wasi") {
+                    Ok(inner)
+                } else {
+                    inner.canonicalize()
+                };
+                canonical
                     .map_err(|_| Error::CannotCanonicalize)
                     .map(|inner| CanonicalPath { inner })
             })

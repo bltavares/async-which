@@ -8,12 +8,9 @@ use futures::prelude::*;
 use regex::Regex;
 #[cfg(feature = "regex")]
 use std::borrow::Borrow;
-use std::env;
 use std::ffi::OsStr;
 use std::iter;
 use std::path::{Path, PathBuf};
-#[cfg(any(feature = "regex", target_os = "windows"))]
-use tokio::fs;
 
 #[async_trait::async_trait]
 pub trait Checker: Sync {
@@ -54,13 +51,33 @@ impl Finder {
         Finder
     }
 
+    #[cfg(target_os = "wasi")]
+    fn path_split<U>(p: U) -> Vec<PathBuf>
+    where
+        U: AsRef<OsStr>,
+    {
+        p.as_ref()
+            .to_string_lossy()
+            .split(":")
+            .map(PathBuf::from)
+            .collect()
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    fn path_split<U>(p: U) -> Vec<PathBuf>
+    where
+        U: AsRef<OsStr>,
+    {
+        std::env::split_paths(&p).collect()
+    }
+
     pub fn find<T, U, V>(
         &self,
         binary_name: T,
         paths: Option<U>,
         cwd: Option<V>,
         binary_checker: CompositeChecker,
-    ) -> Result<impl Stream<Item = PathBuf>>
+    ) -> impl Stream<Item = Result<PathBuf>>
     where
         T: AsRef<OsStr>,
         U: AsRef<OsStr>,
@@ -68,62 +85,92 @@ impl Finder {
     {
         let path = PathBuf::from(&binary_name);
 
-        let binary_path_candidates = match cwd {
-            Some(cwd) if path.has_separator() => {
+        let binary_path_candidates = match (cwd, paths) {
+            (Some(cwd), _) if path.has_separator() => {
                 // Search binary in cwd if the path have a path separator.
-                Either::Left(Self::cwd_search_candidates(path, cwd).into_iter())
+                Ok(Either::Left(
+                    Self::cwd_search_candidates(path, cwd).into_iter(),
+                ))
             }
-            _ => {
+            (_, Some(p)) => {
                 // Search binary in PATHs(defined in environment variable).
-                let p = paths.ok_or(Error::CannotFindBinaryPath)?;
-                let paths: Vec<_> = env::split_paths(&p).collect();
-
-                Either::Right(Self::path_search_candidates(path, paths).into_iter())
+                let paths = Self::path_split(p);
+                Ok(Either::Right(
+                    Self::path_search_candidates(path, paths).into_iter(),
+                ))
             }
+            _ => Err(Error::CannotFindBinaryPath),
         };
 
-        let tasks = async_stream::stream! {
-            for p in binary_path_candidates {
+        async_stream::try_stream! {
+            for p in binary_path_candidates? {
+                println!("antes {:?}", p);
+
                 if binary_checker.is_valid(&p).await {
+                println!("depois {:?}", p);
+
                     yield correct_casing(p).await;
                 }
             }
-        };
-        Ok(tasks)
+        }
+    }
+
+    #[cfg(target_os = "wasi")]
+    fn select_all_files(paths: Vec<PathBuf>) -> impl Stream<Item = Result<PathBuf>> {
+        async_stream::try_stream! {
+            for p in paths {
+                let files = tokio::task::spawn(async {
+                    std::fs::read_dir(p).map_err(|_| Error::CannotFindBinaryPath)
+                })
+                .await
+                .into_iter()
+                .flatten()
+                .flatten();
+
+                for p in files {
+                    yield p.map_err(|_| Error::CannotFindBinaryPath)?.path();
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    fn select_all_files(paths: Vec<PathBuf>) -> impl Stream<Item = Result<PathBuf>> {
+        use futures::stream::FuturesOrdered;
+        use tokio_stream::wrappers::ReadDirStream;
+
+        let jobs = paths
+            .into_iter()
+            .map(|f| tokio::fs::read_dir(f))
+            .collect::<FuturesOrdered<_>>();
+
+        jobs.map_ok(ReadDirStream::new)
+            .try_flatten()
+            .map_err(|_| Error::CannotFindBinaryPath)
+            .map_ok(|f| f.path())
     }
 
     #[cfg(feature = "regex")]
     pub fn find_re<T>(
         &self,
         binary_regex: impl Borrow<Regex>,
-        paths: Option<T>,
+        paths: T,
         binary_checker: CompositeChecker,
-    ) -> Result<impl Iterator<Item = PathBuf>>
+    ) -> impl Stream<Item = Result<PathBuf>>
     where
         T: AsRef<OsStr>,
     {
-        let p = paths.ok_or(Error::CannotFindBinaryPath)?;
-        // Collect needs to happen in order to not have to
-        // change the API to borrow on `paths`.
-        #[allow(clippy::needless_collect)]
-        let paths: Vec<_> = env::split_paths(&p).collect();
-
-        let matching_re = paths
-            .into_iter()
-            .flat_map(fs::read_dir)
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(move |p| {
-                if let Some(unicode_file_name) = p.file_name().unwrap().to_str() {
-                    binary_regex.borrow().is_match(unicode_file_name)
-                } else {
-                    false
+        let paths = Self::path_split(paths);
+        async_stream::try_stream! {
+            for await f in Self::select_all_files(paths) {
+                let f = f?;
+                if let Some(unicode_file_name) =  f.file_name().unwrap().to_str() {
+                    if binary_regex.borrow().is_match(&unicode_file_name) && binary_checker.is_valid(&f).await {
+                        yield f;
+                    }
                 }
-            })
-            .filter(move |p| binary_checker.is_valid(p));
-
-        Ok(matching_re)
+            }
+        }
     }
 
     fn cwd_search_candidates<C>(binary_name: PathBuf, cwd: C) -> impl IntoIterator<Item = PathBuf>
@@ -147,7 +194,7 @@ impl Finder {
         Self::append_extension(new_paths)
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     fn append_extension<P>(paths: P) -> impl IntoIterator<Item = PathBuf>
     where
         P: IntoIterator<Item = PathBuf>,
@@ -167,7 +214,7 @@ impl Finder {
         // (In one use of PATH_EXTENSIONS we skip the dot, but in the other we need it;
         // hence its retention.)
         static PATH_EXTENSIONS: Lazy<Vec<String>> = Lazy::new(|| {
-            env::var("PATHEXT")
+            std::env::var("PATHEXT")
                 .map(|pathext| {
                     pathext
                         .split(';')
@@ -215,12 +262,22 @@ impl Finder {
                 }
             })
     }
+
+    #[cfg(target_os = "wasi")]
+    fn append_extension<P>(paths: P) -> impl IntoIterator<Item = PathBuf>
+    where
+        P: IntoIterator<Item = PathBuf>,
+    {
+        paths
+            .into_iter()
+            .flat_map(|f| [f.clone(), f.with_extension(std::env::consts::EXE_EXTENSION)])
+    }
 }
 
 #[cfg(target_os = "windows")]
 async fn correct_casing(mut p: PathBuf) -> PathBuf {
     if let (Some(parent), Some(file_name)) = (p.parent(), p.file_name()) {
-        if let Ok(mut iter) = fs::read_dir(parent).await {
+        if let Ok(mut iter) = tokio::fs::read_dir(parent).await {
             while let Ok(e) = iter.next_entry().await {
                 if let Some(e) = e {
                     if e.file_name().eq_ignore_ascii_case(file_name) {
