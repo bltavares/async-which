@@ -115,27 +115,27 @@ impl Finder {
         }
     }
 
-    #[cfg(target_os = "wasi")]
-    fn select_all_files(paths: Vec<PathBuf>) -> impl Stream<Item = Result<PathBuf>> {
-        async_stream::try_stream! {
+    #[cfg(all(feature = "regex", target_os = "wasi"))]
+    fn select_all_files(paths: Vec<PathBuf>) -> impl Stream<Item = PathBuf> {
+        async_stream::stream! {
             for p in paths {
-                let files = tokio::task::spawn(async {
-                    std::fs::read_dir(p).map_err(|_| Error::CannotFindBinaryPath)
-                })
-                .await
-                .into_iter()
-                .flatten()
-                .flatten();
+                let files = tokio::task::spawn(async { std::fs::read_dir(p) })
+                    .await
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter_map(|f| f.ok())
+                    .map(|p| p.path());
 
                 for p in files {
-                    yield p.map_err(|_| Error::CannotFindBinaryPath)?.path();
+                    yield p
                 }
             }
         }
     }
 
-    #[cfg(not(target_os = "wasi"))]
-    fn select_all_files(paths: Vec<PathBuf>) -> impl Stream<Item = Result<PathBuf>> {
+    #[cfg(all(feature = "regex", not(target_os = "wasi")))]
+    fn select_all_files(paths: Vec<PathBuf>) -> impl Stream<Item = PathBuf> {
         use futures::stream::FuturesOrdered;
         use tokio_stream::wrappers::ReadDirStream;
 
@@ -146,8 +146,8 @@ impl Finder {
 
         jobs.map_ok(ReadDirStream::new)
             .try_flatten()
-            .map_err(|_| Error::CannotFindBinaryPath)
-            .map_ok(|f| f.path())
+            .filter_map(|f| async { f.ok() })
+            .map(|f| f.path())
     }
 
     #[cfg(feature = "regex")]
@@ -163,8 +163,7 @@ impl Finder {
         let paths = Self::path_split(paths);
         async_stream::try_stream! {
             for await f in Self::select_all_files(paths) {
-                let f = f?;
-                if let Some(unicode_file_name) =  f.file_name().unwrap().to_str() {
+                if let Some(unicode_file_name) =  f.file_name().and_then(OsStr::to_str) {
                     if binary_regex.borrow().is_match(&unicode_file_name) && binary_checker.is_valid(&f).await {
                         yield f;
                     }
