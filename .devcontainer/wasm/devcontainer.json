@@ -1,0 +1,53 @@
+{
+    "name": "Rust WASM",
+    "image": "brendanburns/wasm-dev-base:0.0.7",
+    "remoteEnv": {
+        "PATH": "${containerEnv:PATH}:/usr/local/lib/wasi-sdk-17.0/bin",
+        "CARGO_TARGET_WASM32_WASI_RUNNER": "wasmtime --mapdir=/tmp::/tmp/which"
+    },
+    "features": {
+        "devwasm.azurecr.io/dev-wasm/dev-wasm-feature/wasmtime-wasi:0.0.4": {
+            "version": "17"
+        },
+        "ghcr.io/devcontainers/features/rust": {},
+        "devwasm.azurecr.io/dev-wasm/dev-wasm-feature/rust-wasi:0.0.1": {},
+        "ghcr.io/devcontainers/features/common-utils:2": {
+            "installZsh": true,
+            "configureZshAsDefaultShell": true,
+            "upgradePackages": true,
+            "nonFreePackages": true,
+            "username": "automatic",
+            "userUid": "automatic",
+            "userGid": "automatic"
+        }
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-vscode.cpptools",
+                "rust-lang.rust-analyzer"
+            ],
+            "settings": {
+                "files.watcherExclude": {
+                    "**/target/**": true
+                },
+                "rust-analyzer.cargo.target": "wasm32-wasi",
+                "rust-analyzer.cargo.noDefaultFeatures": true,
+                "rust-analyzer.cargo.features": [
+                    "regex"
+                ],
+                "rust-analyzer.server.extraEnv": {
+                    "RUSTUP_TOOLCHAIN": "nightly"
+                }
+            }
+        }
+    },
+    // Use 'mounts' to make the cargo cache persistent in a Docker Volume.
+    "mounts": [
+        {
+            "source": "devcontainer-cargo-cache-${devcontainerId}",
+            "target": "/usr/local/cargo",
+            "type": "volume"
+        }
+    ]
+}
