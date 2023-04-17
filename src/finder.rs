@@ -130,13 +130,13 @@ impl Finder {
 
     #[cfg(all(feature = "regex", not(target_os = "wasi")))]
     fn select_all_files(paths: Vec<PathBuf>) -> impl Stream<Item = PathBuf> {
-        use futures::stream::FuturesOrdered;
+        use futures::stream::FuturesUnordered;
         use tokio_stream::wrappers::ReadDirStream;
 
         let jobs = paths
             .into_iter()
             .map(|f| tokio::fs::read_dir(f))
-            .collect::<FuturesOrdered<_>>();
+            .collect::<FuturesUnordered<_>>();
 
         jobs.map_ok(ReadDirStream::new)
             .try_flatten()

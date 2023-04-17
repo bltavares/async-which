@@ -40,3 +40,7 @@ tokio-test = "0.4.2"
 
 [package.metadata.docs.rs]
 all-features = true
+
+[workspace]
+members = [".", "cli"]
+default-members = ["cli"]
