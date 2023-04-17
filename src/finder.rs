@@ -115,23 +115,17 @@ impl Finder {
         }
     }
 
-    #[cfg(all(feature = "regex", target_os = "wasi"))]
+    #[cfg(all(feature = "regex", all(target_os = "wasi")))]
     fn select_all_files(paths: Vec<PathBuf>) -> impl Stream<Item = PathBuf> {
-        async_stream::stream! {
-            for p in paths {
-                let files = tokio::task::spawn(async { std::fs::read_dir(p) })
-                    .await
-                    .into_iter()
-                    .flatten()
-                    .flatten()
-                    .filter_map(|f| f.ok())
-                    .map(|p| p.path());
+        let iter = paths
+            .into_iter()
+            .map(std::fs::read_dir)
+            .filter_map(|f| f.ok())
+            .flatten()
+            .filter_map(|f| f.ok())
+            .map(|p| p.path());
 
-                for p in files {
-                    yield p
-                }
-            }
-        }
+        stream::iter(iter)
     }
 
     #[cfg(all(feature = "regex", not(target_os = "wasi")))]

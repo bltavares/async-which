@@ -62,14 +62,9 @@ impl Checker for ExistedChecker {
 
     #[cfg(target_os = "wasi")]
     async fn is_valid(&self, path: &Path) -> bool {
-        let path = path.to_owned();
-        tokio::task::spawn(async {
-            std::fs::metadata(path)
-                .map(|metadata| metadata.is_file())
-                .unwrap_or(false)
-        })
-        .await
-        .unwrap_or(false)
+        std::fs::metadata(path)
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false)
     }
 }
 
